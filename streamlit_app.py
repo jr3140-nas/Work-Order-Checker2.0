@@ -7,11 +7,11 @@ import streamlit as st
 from datetime import datetime, date
 from typing import Dict, Any, List, Tuple
 
-# Prefer ReportLab; fall back to fpdf2 if ReportLab isn't available.
+# PDF imports (top of file)
 PDF_ENGINE = "reportlab"
 try:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    from reportlab.lib.pagesizes import letter, portrait
+    from reportlab.lib.pagesizes import letter, landscape   # <-- change here
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
     from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -209,12 +209,23 @@ def _compute_rl_col_widths(rows: List[List[str]], page_inner_width: float) -> Li
 # ------------------------ PDF Output ------------------------
 def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> bytes:
     if PDF_ENGINE == "reportlab":
+        import io
         buf = io.BytesIO()
-        # Force portrait orientation explicitly
-        doc = SimpleDocTemplate(buf, pagesize=portrait(letter), leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+
+        # Force LANDSCAPE Letter and slightly smaller margins to maximize usable width
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=landscape(letter),   # <-- landscape
+            leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24
+        )
+
         styles = getSampleStyleSheet()
         title_style = styles["Title"]
         header_style = styles["Heading2"]
+        body8 = ParagraphStyle(
+            "Body8", parent=styles["BodyText"], fontName="Helvetica", fontSize=8, leading=10
+        )
+
         table_style = TableStyle([
             ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
             ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
@@ -225,25 +236,54 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> byt
             ("VALIGN", (0,0), (-1,-1), "TOP"),
         ])
 
-        # smaller body paragraph style for wrapping
-        body8 = ParagraphStyle(
-            "Body8",
-            parent=styles["BodyText"],
-            fontName="Helvetica",
-            fontSize=8,
-            leading=10,
-        )
+        # ---- helpers for auto-sizing ----
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        def compute_col_widths(raw_rows: List[List[str]], page_inner_width: float) -> List[float]:
+            """Measure text at 8pt and scale to fit the printable width (no overflow)."""
+            minw = [110, 90, 90, 100, 220, 220]  # Name, WO, Sum, Type, Desc, Problem
+            pad = 14
+            naturals = []
+            for c in range(len(raw_rows[0])):
+                mx = 0.0
+                for r in raw_rows:
+                    txt = str(r[c]) if r[c] is not None else ""
+                    mx = max(mx, stringWidth(txt, "Helvetica", 8))
+                naturals.append(max(minw[c], mx + pad))
+
+            total = sum(naturals)
+            if total <= page_inner_width:
+                return naturals
+
+            # Proportional shrink without going below min widths
+            over = total - page_inner_width
+            shrinkable = [max(0.0, naturals[i] - minw[i]) for i in range(len(naturals))]
+            total_shrinkable = sum(shrinkable)
+            if total_shrinkable <= 0:
+                # last-resort uniform scale
+                scale = page_inner_width / total if total > 0 else 1.0
+                return [w * scale for w in naturals]
+
+            widths = []
+            for i, w in enumerate(naturals):
+                reduce = over * (shrinkable[i] / total_shrinkable)
+                widths.append(max(minw[i], w - reduce))
+            # guarantee <= page width (avoid rounding bleed)
+            fudge = 0.01 * page_inner_width
+            if sum(widths) > page_inner_width:
+                scale = (page_inner_width - fudge) / sum(widths)
+                widths = [w * scale for w in widths]
+            return widths
 
         story: List = []
         story += [Paragraph(f"Daily Report — {selected_date}", title_style), Spacer(1, 6),
                   Paragraph("Sorted by Work Order # within each craft", styles["Normal"]), Spacer(1, 12)]
 
-        page_inner_width = doc.width  # available width after margins
+        page_inner_width = doc.width  # usable width = page width - margins
 
         for craft, rows in crafts.items():
             story.append(Paragraph(str(craft), header_style))
 
-            # Build raw rows (strings) for width measurement
+            # Build string matrix for width measurement
             matrix = [["Name", "Work Order #", "Sum of Hours", "Type", "Description", "Problem"]]
             for r in rows:
                 matrix.append([
@@ -255,18 +295,18 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> byt
                     str(r.get("Problem","")),
                 ])
 
-            col_widths = _compute_rl_col_widths(matrix, page_inner_width)
+            col_widths = compute_col_widths(matrix, page_inner_width)
 
-            # Convert data cells to Paragraph for wrapping
+            # Convert content to Paragraphs for proper wrapping
             data = [matrix[0]]  # header row as plain text
             for raw in matrix[1:]:
                 data.append([
-                    Paragraph(xml_escape(raw[0]), body8),
-                    Paragraph(xml_escape(raw[1]), body8),
-                    Paragraph(xml_escape(raw[2]), body8),
-                    Paragraph(xml_escape(raw[3]), body8),
-                    Paragraph(xml_escape(raw[4]), body8),
-                    Paragraph(xml_escape(raw[5]), body8),
+                    Paragraph(raw[0], body8),
+                    Paragraph(raw[1], body8),
+                    Paragraph(raw[2], body8),
+                    Paragraph(raw[3], body8),
+                    Paragraph(raw[4], body8),
+                    Paragraph(raw[5], body8),
                 ])
 
             tbl = Table(data, repeatRows=1, colWidths=col_widths)
@@ -279,32 +319,34 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> byt
         buf.close()
         return pdf
 
-    # fpdf2 fallback — force portrait and attempt width hints
+    # ------------- FPDF fallback: LANDSCAPE + auto-size -------------
     class PDF(FPDF, HTMLMixin):
         pass
 
-    pdf = PDF(orientation="P", unit="pt", format="Letter")
-    pdf.set_auto_page_break(auto=True, margin=36)
+    margin = 24
+    pdf = PDF(orientation="L", unit="pt", format="Letter")  # <-- landscape
+    pdf.set_left_margin(margin)
+    pdf.set_right_margin(margin)
+    pdf.set_auto_page_break(auto=True, margin=margin)
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 18, f"Daily Report — {selected_date}", ln=1)
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 14, "Sorted by Work Order # within each craft", ln=1)
 
-    page_inner_width = pdf.w - 72  # 36pt margins left+right
+    page_inner_width = pdf.w - pdf.l_margin - pdf.r_margin
 
     def compute_fpdf_widths(rows: List[List[str]]) -> List[float]:
-        # minimal widths to avoid unreadable columns
-        minw = [90, 80, 80, 90, 150, 150]
+        minw = [110, 90, 90, 100, 220, 220]
         pad = 12
         naturals = []
         pdf.set_font("Helvetica", "", 8)
-        for col_idx in range(len(rows[0])):
-            max_w = 0.0
+        for c in range(len(rows[0])):
+            mx = 0.0
             for r in rows:
-                txt = str(r[col_idx]) if r[col_idx] is not None else ""
-                max_w = max(max_w, pdf.get_string_width(txt))
-            naturals.append(max(max_w + pad, minw[col_idx]))
+                txt = str(r[c]) if r[c] is not None else ""
+                mx = max(mx, pdf.get_string_width(txt))
+            naturals.append(max(minw[c], mx + pad))
         total = sum(naturals)
         if total <= page_inner_width:
             return naturals
@@ -316,10 +358,15 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> byt
             return [w * scale for w in naturals]
         widths = []
         for i, w in enumerate(naturals):
-            reduce = over * (shrinkable[i] / total_shrink) if total_shrink > 0 else 0.0
+            reduce = over * (shrinkable[i] / total_shrink)
             widths.append(max(minw[i], w - reduce))
+        # final guard
+        if sum(widths) > page_inner_width:
+            scale = (page_inner_width - 0.01 * page_inner_width) / sum(widths)
+            widths = [w * scale for w in widths]
         return widths
 
+    th = 14  # row height
     for craft, rows in crafts.items():
         pdf.ln(6)
         pdf.set_font("Helvetica", "B", 13)
@@ -337,26 +384,21 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]]) -> byt
             ])
         col_widths = compute_fpdf_widths(matrix)
 
-        # Render table header
+        # header
         pdf.set_font("Helvetica", "B", 9)
-        th = 14
-        x0 = pdf.get_x()
-        y0 = pdf.get_y()
-        headers = matrix[0]
-        for w, txt in zip(col_widths, headers):
+        for w, txt in zip(col_widths, matrix[0]):
             pdf.cell(w, th, txt, border=1)
         pdf.ln(th)
 
-        # Render rows (simple, no wrapping to keep code compact)
+        # rows (truncate to width to avoid spill; ReportLab handles wrap)
         pdf.set_font("Helvetica", "", 8)
         for raw in matrix[1:]:
             for w, txt in zip(col_widths, raw):
-                # truncate long text for fallback to keep layout; primary engine (ReportLab) handles wrapping
-                s = str(txt)
-                max_chars = int(max(5, w / 4.5))  # rough fit heuristic
-                if len(s) > max_chars:
-                    s = s[:max_chars-1] + "…"
-                pdf.cell(w, th, s, border=1)
+                cell_text = str(txt)
+                max_chars = max(5, int(w / 4.6))  # crude fit heuristic
+                if len(cell_text) > max_chars:
+                    cell_text = cell_text[:max_chars-1] + "…"
+                pdf.cell(w, th, cell_text, border=1)
             pdf.ln(th)
 
     return bytes(pdf.output(dest="S").encode("latin1"))
