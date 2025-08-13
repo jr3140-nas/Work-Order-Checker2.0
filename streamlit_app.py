@@ -71,24 +71,38 @@ def name_key(s: str) -> str:
 # ------------------------ Mapping from Address Book ------------------------
 def build_name_to_craft(addr_df: pd.DataFrame) -> Tuple[Dict[str, str], List[str]]:
     """Return NAME->Craft Description (uppercased names). Also return duplicate/conflict messages."""
-    # normalize columns (strip)
-    addr_df = addr_df.rename(columns={c: str(c).strip(): str(c).strip() for c in addr_df.columns})
-    # allow minor column variants
-    col_map = {c.lower(): c for c in addr_df.columns}
+    # Normalize columns (strip whitespace); handles non-string column labels safely.
+    addr_df = addr_df.rename(columns=lambda c: str(c).strip())
+
+    # Build a lookup for case-insensitive column matching.
+    col_map = {str(c).strip().lower(): str(c).strip() for c in addr_df.columns}
     name_col = col_map.get("name")
     craft_desc_col = col_map.get("craft description") or col_map.get("craft_description")
-    if not name_col or not craft_desc_col:
-        missing = [x for x in EXPECTED_ADDR_COLS if x.lower() not in col_map]
-        raise ValueError(f"Address Book missing required columns: {missing}. Found columns: {list(addr_df.columns)}")
 
-    # drop rows missing name or craft desc
+    if not name_col or not craft_desc_col:
+        missing = []
+        if not name_col:
+            missing.append("Name")
+        if not craft_desc_col:
+            missing.append("Craft Description")
+        raise ValueError(
+            f"Address Book missing required columns: {missing}. "
+            f"Found columns: {list(addr_df.columns)}"
+        )
+
+    # Drop rows with missing name or craft description
     ab = addr_df[[name_col, craft_desc_col]].dropna(how="any").copy()
+
+    # Normalize names to a stable match key (UPPER + single-spaced)
+    def name_key(s: str) -> str:
+        return " ".join(str(s).strip().upper().split())
+
     ab[name_col] = ab[name_col].astype(str).map(name_key)
     ab[craft_desc_col] = ab[craft_desc_col].astype(str).str.strip()
 
-    # build map and detect conflicts
-    conflicts = []
+    # Build mapping and detect conflicts
     mapping: Dict[str, str] = {}
+    conflicts: List[str] = []
     for _, row in ab.iterrows():
         nm = row[name_col]
         cd = row[craft_desc_col]
