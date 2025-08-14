@@ -1,7 +1,5 @@
-
 import io
 import re
-import itertools
 from xml.sax.saxutils import escape as xml_escape
 import pandas as pd
 import streamlit as st
@@ -31,7 +29,6 @@ EXPECTED_TIME_COLS = [
     "AddressBookNumber","Name","Production Date","OrderNumber","Sum of Hours.","Hours Estimated",
     "Status","Type","PMFrequency","Description","Problem","Lead Area","Craft","CostCenter","UnitNumber","StructureTag"
 ]
-EXPECTED_ADDR_COLS = ["Name", "Craft Description"]
 
 # --- Work Order Type Mapping ---
 TYPE_MAP = {
@@ -43,12 +40,15 @@ TYPE_MAP = {
     "W": "Case","X": "General Work Request","Y": "Follow Up Work Request","Z": "System Work Request",
 }
 
-GREEN1 = "#2ca02c"   # inspection
-GREEN2 = "#228b22"   # restore/replace
-RED1   = "#d62728"   # emergency
-RED2   = "#b22222"   # break in
-# fallback palette (cycled for all other types)
-FALLBACK = list(plt.get_cmap("tab20").colors)
+# ---- Color rules (global & consistent across all pies) ----
+SPECIAL_COLORS = {
+    "inspection maintenance order": "#2ca02c",  # green
+    "pm restore/replace": "#228b22",            # darker green
+    "emergency order": "#d62728",               # red
+    "break in": "#b22222",                      # dark red
+}
+OTHER_COLOR = "#b0b0b0"                          # “Other” bucket
+PALETTE = list(plt.get_cmap("tab20").colors)     # remaining types
 
 def type_to_desc(v: Any) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)): return ""
@@ -119,32 +119,14 @@ def build_name_to_craft(addr_df: pd.DataFrame) -> Tuple[Dict[str, str], List[str
 
     return mapping, conflicts
 
-# ------------------------ Area categorization & filter ------------------------
-def craft_category(desc: str) -> str:
-    s = (desc or "").lower()
-    if any(k in s for k in ["hvac", "utility", "utilities", "wtp", "water treatment"]):
-        return "HVAC & Utilities"
-    if "elec" in s or "elect" in s:
-        return "Electrical"
-    if "mech" in s:
-        return "Mechanical"
-    return "Other"
-
-def area_passes(desc: str, mode: str) -> bool:
-    if mode == "All": return True
-    return craft_category(desc) == mode
-
 # ------------------------ Report Logic ------------------------
-def build_report(df: pd.DataFrame, selected_date: str, name_to_craft: Dict[str, str], area_mode: str):
+def build_report(df: pd.DataFrame, selected_date: str, name_to_craft: Dict[str, str]):
     df = df.copy()
     df["__ProdDate"] = df["Production Date"].apply(normalize_excel_date)
     df = df[df["__ProdDate"] == selected_date]
 
     df["__NameKey"] = df["Name"].astype(str).map(name_key)
     df["__CraftDesc"] = df["__NameKey"].map(name_to_craft).fillna("(Unmapped Name)")
-
-    # Filter by area selection
-    df = df[df["__CraftDesc"].map(lambda x: area_passes(x, area_mode))]
 
     groups = {}
     for _, r in df.iterrows():
@@ -195,30 +177,32 @@ def summarize_hours_by_type_per_area(df: pd.DataFrame) -> Dict[str, Dict[str, fl
         result.setdefault(area, {}); result[area][t] = result[area].get(t, 0.0) + h
     return result
 
-# ------------------------ Coloring logic ------------------------
-def label_color(label: str) -> str | None:
-    l = (label or "").strip().lower()
-    if l == "inspection maintenance order":
-        return "#2ca02c"  # green
-    if l == "pm restore/replace":
-        return "#228b22"  # green (darker)
-    if l == "emergency order":
-        return "#d62728"  # red
-    if l == "break in":
-        return "#b22222"  # dark red
-    return None
-
-def colors_for_labels(labels: List[str]) -> List[str]:
-    out = []
-    cyc = itertools.cycle(plt.get_cmap("tab20").colors)
-    for lab in labels:
-        c = label_color(lab)
-        if c is None:
-            c = next(cyc)
-        out.append(c)
-    return out
+# ------------------------ Global color mapping (consistent across pies) ------------------------
+def build_global_color_map(summary: Dict[str, Dict[str, float]]) -> Dict[str, str]:
+    labels = set()
+    for typemap in summary.values():
+        labels.update(typemap.keys())
+    labels = { (l or '').strip() for l in labels }
+    cmap: Dict[str, str] = {}
+    # specials first
+    for lab in list(labels):
+        if lab.lower() in SPECIAL_COLORS:
+            cmap[lab] = SPECIAL_COLORS[lab.lower()]
+    labels = {l for l in labels if l not in cmap}
+    # stable assignment for the remainder
+    it = iter(PALETTE)
+    for lab in sorted(labels, key=str.lower):
+        try:
+            cmap[lab] = next(it)
+        except StopIteration:
+            it = iter(PALETTE); cmap[lab] = next(it)
+    # “Other” bucket color
+    cmap["Other"] = OTHER_COLOR
+    cmap["other"] = OTHER_COLOR
+    return cmap
 
 def render_pie_pages(summary: Dict[str, Dict[str, float]], selected_date: str, label_mode: str) -> List[bytes]:
+    color_map = build_global_color_map(summary)
     items = sorted(summary.items(), key=lambda kv: sum(kv[1].values()), reverse=True)
     pies_per_page = 6
     pages: List[bytes] = []
@@ -243,8 +227,7 @@ def render_pie_pages(summary: Dict[str, Dict[str, float]], selected_date: str, l
             if other > 0: lbl2.append("Other"); sz2.append(other)
             total = sum(sz2)
 
-            # Colors with special rules
-            cols = colors_for_labels(lbl2)
+            cols = [color_map.get(l, OTHER_COLOR) for l in lbl2]
 
             if label_mode == "percent": autopct = "%1.0f%%"
             else:
@@ -324,7 +307,7 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]], cover_
             if iw is None or ih is None:
                 iw, ih = img.wrap(0, 0)
             max_w, max_h = doc.width, doc.height
-            scale = min(max_w / iw, max_h / ih) * 0.95  # headroom
+            scale = min(max_w / iw, max_h / ih) * 0.95
             img.drawWidth = iw * scale; img.drawHeight = ih * scale
             story.append(img)
             if idx < len(pie_pages) - 1:
@@ -463,7 +446,7 @@ def make_pdf(selected_date: str, crafts: Dict[str, List[Dict[str, Any]]], cover_
     return bytes(pdf.output(dest="S").encode("latin1"))
 
 # ------------------------ UI ------------------------
-st.title("Craft-Based Daily Report (Excel → PDF) — Cover Page & Area Filter")
+st.title("Craft-Based Daily Report (Excel → PDF) — Global Pie Colors")
 
 with st.sidebar:
     st.markdown("**Instructions**")
@@ -471,8 +454,7 @@ with st.sidebar:
     st.markdown("2) Upload the **Time on Work Order** (.xlsx).")
     st.markdown("3) Pick a **Production Date** (MM/DD/YYYY).")
     st.markdown("4) Choose **Cover Labels**: Percent or Hours.")
-    st.markdown("5) Use **Area Filter** to focus on Mechanical, Electrical, or HVAC & Utilities.")
-    st.markdown("6) Download PDF. The first page(s) show pies by area; details follow.")
+    st.markdown("5) Download PDF. The first page(s) show pies by area; details follow.")
 
 col1, col2, col3 = st.columns([1,1,1])
 with col1:
@@ -481,8 +463,6 @@ with col2:
     time_file = st.file_uploader("Upload Time on Work Order (.xlsx)", type=["xlsx"], key="time")
 with col3:
     label_mode = st.radio("Cover Labels", options=["percent", "hours"], index=0, horizontal=False)
-
-area_mode = st.radio("Area Filter", options=["All","Mechanical","Electrical","HVAC & Utilities"], index=0, horizontal=True)
 
 cap_choice = st.selectbox("PDF text length (Description/Problem)", ["Compact (450)", "Standard (600)", "Verbose (800)"], index=1)
 cap_map = {"Compact (450)": 450, "Standard (600)": 600, "Verbose (800)": 800}
@@ -517,9 +497,8 @@ if time_file is not None:
 selected_date = st.selectbox("Production Date", options=(dates if dates else [""]), index=(len(dates)-1 if dates else 0))
 
 if df is not None and addr_map is not None and selected_date:
-    crafts, unmapped_names, df_filtered = build_report(df, selected_date, addr_map, area_mode)
-    if unmapped_names: st.error("Unmapped Names (from selected date & filter):\n- " + "\n- ".join(unmapped_names))
-
+    crafts, unmapped_names, df_filtered = build_report(df, selected_date, addr_map)
+    if unmapped_names: st.error("Unmapped Names (from selected date):\n- " + "\n- ".join(unmapped_names))
     cover_summary = summarize_hours_by_type_per_area(df_filtered)
 
     with st.expander("Show tabular summary"):
@@ -531,7 +510,7 @@ if df is not None and addr_map is not None and selected_date:
         st.dataframe(pd.DataFrame(rows))
 
     for craft, rows in crafts.items():
-        st.subheader(f"{craft}  ·  {craft_category(craft)}")
+        st.subheader(craft)
         st.dataframe(pd.DataFrame(rows, columns=["Name","Work Order #","Sum of Hours","Type","Description","Problem"]))
 
     pdf_bytes = make_pdf(selected_date, crafts, cover_summary, label_mode, cap_desc=cap_val, cap_prob=cap_val)
